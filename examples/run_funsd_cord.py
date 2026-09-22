@@ -545,6 +545,9 @@ def main():
         if data_args.visual_embed:
             tokenized_inputs["images"] = images
 
+        tokenized_inputs.pop("overflow_to_sample_mapping", None)
+        tokenized_inputs.pop("offset_mapping", None)
+
         return tokenized_inputs
 
     if training_args.do_train:
