@@ -3,12 +3,12 @@
 set -e
 
 # Đổi đường dẫn làm việc sang đúng thư mục trên Kaggle
-cd /kaggle/working/KIE_Layoutlm
+cd /kaggle/working/layoutlmv3-1
 
 # Khai báo biến trỏ thẳng vào Python của Conda
 PYTHON_CMD="/kaggle/working/miniconda/envs/layoutlmv3/bin/python"
 
-export PYTHONPATH="/kaggle/working/KIE_Layoutlm:$PYTHONPATH"
+export PYTHONPATH="/kaggle/working/layoutlmv3-1:$PYTHONPATH"
 export TOKENIZERS_PARALLELISM=false
 export WANDB_PROJECT="FUNSD-Base-Experiment"
 

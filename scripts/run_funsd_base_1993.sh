@@ -1,6 +1,6 @@
-cd /kaggle/working/KIE_Layoutlm
+cd /kaggle/working/layoutlmv3-1
 
-export PYTHONPATH="/kaggle/working/KIE_Layoutlm:$PYTHONPATH"
+export PYTHONPATH="/kaggle/working/layoutlmv3-1:$PYTHONPATH"
 export TOKENIZERS_PARALLELISM=false
 export WANDB_PROJECT="FUNSD-Base-Experiment"
 
