@@ -1,34 +1,44 @@
 #!/bin/bash
+
 set -e
 
-cd /home/s24gbn1/Documents/phg/unilm/layoutlmv3
-export PYTHONPATH="/home/s24gbn1/Documents/phg/unilm/layoutlmv3:$PYTHONPATH"
+# Đổi đường dẫn làm việc sang đúng thư mục trên Kaggle
+cd /kaggle/working/KIE_Layoutlm
+
+# Khai báo biến trỏ thẳng vào Python của Conda
+PYTHON_CMD="/kaggle/working/miniconda/envs/layoutlmv3/bin/python"
+
+export PYTHONPATH="/kaggle/working/KIE_Layoutlm:$PYTHONPATH"
 export TOKENIZERS_PARALLELISM=false
-export WANDB_PROJECT="funsd-LISC-Experiment"
+export WANDB_PROJECT="FUNSD-Base-Experiment"
 
 SEEDS=(42 123 1993)
 
 for SEED in "${SEEDS[@]}"
 do
-    OUT_DIR="./funsd-large-bdr-seed${SEED}"
+    OUT="./funsd-base-seed${SEED}"
 
     echo ""
     echo "============================================================"
-    echo "RUNNING SEED = ${SEED}"
+    echo "FUNSD BASE - SEED = ${SEED}"
     echo "============================================================"
-    # Dọn dẹp checkpoint cũ của seed hiện tại
-    rm -rf "$OUT_DIR"
 
-    python examples/run_funsd_cord.py \
+    if [ -f "$OUT/eval_results.json" ]; then
+        echo "[SKIP] Seed ${SEED} đã có kết quả."
+        continue
+    fi
+
+    rm -rf "$OUT"
+
+    # SỬA LỖI 3: Dùng torchrun thay cho torch.distributed.launch
+    $PYTHON_CMD -m torch.distributed.run --nproc_per_node=2 examples/run_funsd_cord.py \
       --dataset_name funsd \
       --do_train \
       --do_eval \
       --do_predict \
       --use_segment_head \
-      --model_name_or_path models/layoutlmv3-large \
-      --output_dir "$OUT_DIR" \
-      --segment_level_layout 1 \
-      --visual_embed 1 \
+      --model_name_or_path /kaggle/working/layoutlmv3-base-local \
+      --output_dir "$OUT" \
       --input_size 224 \
       --max_steps 1000 \
       --save_steps 1000 \
@@ -39,46 +49,32 @@ do
       --per_device_train_batch_size 2 \
       --gradient_accumulation_steps 8 \
       --dataloader_num_workers 4 \
-      --report_to wandb \
-      --run_name "FUnSD-LR-Split-seed${SEED}" \
+      --remove_unused_columns False \
+      --report_to none \
+      --run_name "FUNSD-LR-Split-seed${SEED}" \
       --seed "$SEED" \
       --overwrite_output_dir \
-      --overwrite_cache \
-      --use_hierarchical_position_encoding \
-      --max_line_position 100 \
-      --max_block_position 30 \
-      --use_column_encoding True \
-      --max_column_position 8 \
-      --use_intra_line_boundary True \
-      --lambda_bound_init 0.1
-
+      --overwrite_cache
+      # SỬA LỖI 2: Đã loại bỏ --segment_level_layout 1 và --visual_embed 1 (Mặc định đã là True)
 done
 
 echo ""
 echo "============================================================"
-echo "CALCULATING 3-SEED MEAN ± STD (LISC)"
+echo "CALCULATING FUNSD BASE 3-SEED MEAN ± STD"
 echo "============================================================"
 
-python - <<'PY'
+# CŨNG DÙNG CONDA PYTHON CHO ĐOẠN SCRIPT TÍNH TOÁN NÀY
+$PYTHON_CMD - <<'PY'
 import os
 import json
 import numpy as np
 
 seeds = [42, 123, 1993]
-
-metrics = [
-    "eval_accuracy",
-    "eval_f1",
-    "eval_precision",
-    "eval_recall",
-    "eval_loss",
-]
-
+metrics = ["eval_accuracy", "eval_f1", "eval_precision", "eval_recall", "eval_loss"]
 results = {m: [] for m in metrics}
 
 for seed in seeds:
-    path = "./logs/funsd-large-bdr-seed{}/eval_results.json".format(seed)
-
+    path = "./funsd-base-seed{}/eval_results.json".format(seed)
     print("\nSeed {}:".format(seed))
 
     if not os.path.exists(path):
@@ -95,11 +91,10 @@ for seed in seeds:
             print("  {:18s} = {:.6f}".format(metric, value))
 
 print("\n" + "=" * 70)
-print("FINAL HIPOS RESULT: MEAN ± STD")
+print("FINAL FUNSD BASE RESULT: MEAN ± STD")
 print("=" * 70)
 
 summary = {}
-
 for metric in metrics:
     values = results[metric]
     if not values:
@@ -108,22 +103,11 @@ for metric in metrics:
 
     mean = np.mean(values)
     std = np.std(values, ddof=1) if len(values) > 1 else 0.0
+    print("{:18s}: {:.4f} ± {:.4f}".format(metric, mean, std))
 
-    print(
-        "{:18s}: {:.4f} ± {:.4f}".format(
-            metric,
-            mean,
-            std
-        )
-    )
+    summary[metric] = {"values": values, "mean": float(mean), "std": float(std)}
 
-    summary[metric] = {
-        "values": values,
-        "mean": float(mean),
-        "std": float(std),
-    }
-
-output_summary_file = "./logs/funsd-large-bdr-seed{}/funsd_large_bdr_3seed_summary.json".format(seed)
+output_summary_file = "funsd_base_3seed_summary.json"
 with open(output_summary_file, "w") as f:
     json.dump(summary, f, indent=2)
 
