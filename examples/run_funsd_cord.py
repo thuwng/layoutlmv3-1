@@ -6,6 +6,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
+from seqeval.metrics import classification_report
+
 import numpy as np
 from datasets import ClassLabel, load_dataset
 import evaluate
@@ -654,6 +656,18 @@ def main():
         ]
 
         results = metric.compute(predictions=true_predictions, references=true_labels)
+
+        # Tạo bảng thống kê lỗi (Precision, Recall, F1 cho từng nhãn)
+        report = classification_report(true_labels, true_predictions)
+        
+        # Chỉ lưu vào file trong thư mục output (KHÔNG in ra màn hình log)
+        report_file_path = os.path.join(training_args.output_dir, "eval_classification_report.txt")
+        with open(report_file_path, "w", encoding="utf-8") as f:
+            f.write("="*50 + "\n")
+            f.write("📊 THỐNG KÊ LỖI / CHI TIẾT TỪNG NHÃN (EVAL MỚI NHẤT)\n")
+            f.write("="*50 + "\n")
+            f.write(report + "\n")
+
         if data_args.return_entity_level_metrics:
             # Unpack nested dictionaries
             final_results = {}
