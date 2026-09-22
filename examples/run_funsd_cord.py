@@ -637,7 +637,7 @@ def main():
     # ====== KẾT THÚC KIỂM TRA ======
 
     # Metrics
-    metric = load_metric("seqeval")
+    metric = evaluate.load("seqeval")
 
     def compute_metrics(p):
         predictions, labels = p
