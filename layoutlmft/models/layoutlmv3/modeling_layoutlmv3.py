@@ -116,6 +116,9 @@ class LayoutLMv3Embeddings(nn.Module):
                     config.max_column_position,
                     config.coordinate_size
                 )
+                # THÊM DÒNG NÀY (Phase 1): Scale học được cho cột
+                self.column_scale = nn.Parameter(torch.tensor(0.3))
+                
                 self.hierarchical_proj = nn.Linear(
                     config.coordinate_size * 3,  # line + block + column
                     config.hidden_size
@@ -238,8 +241,8 @@ class LayoutLMv3Embeddings(nn.Module):
             if self.column_position_embeddings is not None and column_ids is not None:
                 column_ids_clamped = torch.clamp(column_ids, 0, self.column_position_embeddings.num_embeddings - 1)
                 column_emb = self.column_position_embeddings(column_ids_clamped)
-                # XOÁ DÒNG NÀY: column_weight = 0.3
-                # XOÁ DÒNG NÀY: column_emb = column_weight * column_emb
+                # THÊM DÒNG NÀY (Phase 1): Nhân với scale học được
+                column_emb = self.column_scale * column_emb
                 concat_emb = torch.cat([line_emb, block_emb, column_emb], dim=-1)
             else:
                 concat_emb = torch.cat([line_emb, block_emb], dim=-1)

@@ -64,7 +64,10 @@ do
         --max_block_position 30 \
         --use_column_encoding True \
         --max_column_position 8 \
-        --lambda_bound_init 0.01
+        --lambda_bound_init 0.01 \
+        --geo_y_threshold 10.0 \
+        --geo_x_threshold 50.0 \
+        --lambda_geo_init 0.05
 done
 
 echo ""

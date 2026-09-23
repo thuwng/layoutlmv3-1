@@ -199,7 +199,12 @@ class DataTrainingArguments:
     second_interpolation: str = field(
         default='lanczos', metadata={"help": "Interpolation for discrete vae (random, bilinear, bicubic)"})
     imagenet_default_mean_and_std: bool = field(default=False, metadata={"help": ""})
-
+    geo_y_threshold: float = field(
+        default=10.0, metadata={"help": "Threshold for line clustering on Y axis"}
+    )
+    geo_x_threshold: float = field(
+        default=50.0, metadata={"help": "Threshold for column/block clustering on X axis"}
+    )
 
 def main():
     # See all possible arguments in layoutlmft/transformers/training_args.py
@@ -414,60 +419,69 @@ def main():
         block_ids_all = []   # NEW
         column_ids_all = []
         
-        # Helper function để tính line_ids từ bbox
-        def compute_line_ids(bboxes, y_threshold=10):
-            """Gom các token có y_center gần nhau thành cùng 1 dòng"""
-            if not bboxes:
-                return []
-            # Tính y_center của mỗi bbox
-            y_centers = [(box[1] + box[3]) / 2 for box in bboxes]
-            # Sắp xếp và gom cụm
-            lines = []
-            current_line = 0
-            lines.append(current_line)
-            for i in range(1, len(y_centers)):
-                if abs(y_centers[i] - y_centers[i-1]) > y_threshold:
-                    current_line += 1
-                lines.append(current_line)
-            return lines
-        
-        # Helper function để tính block_ids từ bbox
-        def compute_block_ids(bboxes, x_threshold=50, y_threshold=30):
-            """Gom các token gần nhau thành cùng 1 block (dựa trên khoảng cách XY)"""
-            if not bboxes:
-                return []
-            # Tính center của mỗi bbox
-            centers = [((box[0] + box[2]) / 2, (box[1] + box[3]) / 2) for box in bboxes]
-            # Gán block ID đơn giản: các token có khoảng cách <= threshold
-            blocks = []
-            current_block = 0
-            blocks.append(current_block)
-            for i in range(1, len(centers)):
-                # Tính khoảng cách từ token hiện tại đến token trước
-                dx = centers[i][0] - centers[i-1][0]
-                dy = centers[i][1] - centers[i-1][1]
-                if abs(dx) > x_threshold or abs(dy) > y_threshold:
-                    current_block += 1
-                blocks.append(current_block)
-            return blocks
-        def compute_column_ids(bboxes, x_threshold=50):
-            """Gom các token theo cột dựa trên x_center"""
-            if not bboxes:
-                return []
-            # Tính x_center của mỗi token
-            x_centers = [(box[0] + box[2]) / 2 for box in bboxes]
+        # HÀM MỚI (PHASE 1): Clustering 2D có sort trước
+        def compute_geometry_ids(bboxes, y_thresh=10.0, x_thresh=50.0):
+            n = len(bboxes)
+            if n == 0:
+                return [], [], []
             
-            # Sắp xếp các token theo x_center
-            columns = []
-            current_col = 0
-            columns.append(current_col)
+            # Sort toàn bộ box theo (y_center, x_center)
+            order = sorted(range(n), key=lambda i: ((bboxes[i][1] + bboxes[i][3]) / 2,
+                                                    (bboxes[i][0] + bboxes[i][2]) / 2))
             
-            for i in range(1, len(x_centers)):
-                # Nếu khoảng cách x lớn hơn ngưỡng → cột mới
-                if abs(x_centers[i] - x_centers[i-1]) > x_threshold:
-                    current_col += 1
-                columns.append(current_col)
-            return columns
+            # --- Gom dòng (Line) ---
+            line_of_sorted = [0] * n
+            cur_line = 0
+            prev_y = (bboxes[order[0]][1] + bboxes[order[0]][3]) / 2
+            for k in range(1, n):
+                y = (bboxes[order[k]][1] + bboxes[order[k]][3]) / 2
+                if abs(y - prev_y) > y_thresh:
+                    cur_line += 1
+                line_of_sorted[k] = cur_line
+                prev_y = y
+
+            # --- Gom cột (Column) trong từng dòng ---
+            col_of_sorted = [0] * n
+            idx_by_line = {}
+            for k, ln in enumerate(line_of_sorted):
+                idx_by_line.setdefault(ln, []).append(k)
+                
+            for ln, ks in idx_by_line.items():
+                ks_sorted = sorted(ks, key=lambda k: (bboxes[order[k]][0] + bboxes[order[k]][2]) / 2)
+                cur_col = 0
+                prev_x = None
+                for k in ks_sorted:
+                    x = (bboxes[order[k]][0] + bboxes[order[k]][2]) / 2
+                    if prev_x is not None and abs(x - prev_x) > x_thresh:
+                        cur_col += 1
+                    col_of_sorted[k] = cur_col
+                    prev_x = x
+
+            # --- Gom khối (Block) dựa trên khoảng cách 2D ---
+            block_of_sorted = [0] * n
+            cur_block = 0
+            prev_center = None
+            for k in range(n):
+                cx = (bboxes[order[k]][0] + bboxes[order[k]][2]) / 2
+                cy = (bboxes[order[k]][1] + bboxes[order[k]][3]) / 2
+                if prev_center is not None:
+                    dx, dy = abs(cx - prev_center[0]), abs(cy - prev_center[1])
+                    # Nới lỏng threshold cho block (union các dòng gần nhau)
+                    if dx > x_thresh * 3 or dy > y_thresh * 3:
+                        cur_block += 1
+                block_of_sorted[k] = cur_block
+                prev_center = (cx, cy)
+
+            # --- Trả ngược về thứ tự gốc của dataset ---
+            line_ids = [0] * n
+            block_ids = [0] * n
+            col_ids = [0] * n
+            for k, orig_i in enumerate(order):
+                line_ids[orig_i] = line_of_sorted[k]
+                block_ids[orig_i] = block_of_sorted[k]
+                col_ids[orig_i] = col_of_sorted[k]
+                
+            return line_ids, block_ids, col_ids
         
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
@@ -476,10 +490,11 @@ def main():
             label = examples[label_column_name][org_batch_index]
             bbox = examples["bboxes"][org_batch_index]
 
-            # NEW: Tính line_ids và block_ids cho các token gốc
-            line_ids_orig = compute_line_ids(bbox)
-            block_ids_orig = compute_block_ids(bbox)
-            column_ids_orig = compute_column_ids(bbox, x_threshold=50)
+            line_ids_orig, block_ids_orig, column_ids_orig = compute_geometry_ids(
+                bbox, 
+                y_thresh=data_args.geo_y_threshold, 
+                x_thresh=data_args.geo_x_threshold
+            )
 
             # NEW: recover segment boundaries (giữ nguyên code cũ)
             word_seg_id = None
