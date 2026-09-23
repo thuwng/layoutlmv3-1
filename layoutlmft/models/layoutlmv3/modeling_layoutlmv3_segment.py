@@ -170,7 +170,14 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     def _compute_boundary_loss(self, text_hidden, line_ids, labels, attention_mask, text_len):
         device = text_hidden.device
         
-        # Trượt tensor để tạo cặp (i, i+1)
+        # 1. Cắt tất cả tensor về giới hạn text_len để loại bỏ visual tokens (giải quyết triệt để lỗi 708 vs 511)
+        labels = labels[:, :text_len]
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, :text_len]
+        if line_ids is not None:
+            line_ids = line_ids[:, :text_len]
+            
+        # 2. Trượt tensor để tạo cặp (i, i+1) cho phần văn bản
         h_i = text_hidden[:, :-1, :]
         h_j = text_hidden[:, 1:, :]
         h_pair = torch.cat([h_i, h_j], dim=-1)  # (B, L-1, 2H)
@@ -180,23 +187,21 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         li = labels[:, :-1]
         lj = labels[:, 1:]
         
-        # Tạo mask hợp lệ
+        # 3. Tạo mask hợp lệ
         valid = (li >= 0) & (lj >= 0)
+        
         if attention_mask is not None:
-            am = attention_mask[:, :text_len]
-            valid = valid & (am[:, :-1] == 1) & (am[:, 1:] == 1)
+            valid = valid & (attention_mask[:, :-1] == 1) & (attention_mask[:, 1:] == 1)
             
         if line_ids is not None:
             valid = valid & (line_ids[:, :-1] >= 0) & (line_ids[:, :-1] == line_ids[:, 1:])
             
-        # Xác định same_entity dựa trên quy tắc label parity (sẽ được assert ở run_funsd_cord.py)
+        # 4. Xác định target cho Boundary Loss
         # same_entity = True nếu cùng nhãn (O-O, I-I) HOẶC li là B-X (lẻ) và lj là I-X (chẵn, li+1)
         same_entity = (li == lj) | ((li % 2 == 1) & (lj == li + 1))
-        
-        # Target: 0.0 nếu same_entity, 1.0 nếu khác entity
         target = (~same_entity).float()
         
-        # Tính loss per pair
+        # 5. Tính Loss (BCE)
         loss_per_pair = F.binary_cross_entropy_with_logits(boundary_logit, target, reduction="none")
         loss_per_pair = loss_per_pair * valid.float()
         
