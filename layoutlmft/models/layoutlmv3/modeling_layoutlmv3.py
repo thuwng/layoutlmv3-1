@@ -247,9 +247,9 @@ class LayoutLMv3Embeddings(nn.Module):
             hier_emb = self.hierarchical_proj(concat_emb)
         
             if hier_emb.shape[1] == embeddings.shape[1]:
-                embeddings = embeddings + hier_emb
+                embeddings = embeddings + self.hier_scale * hier_emb
             elif hier_emb.shape[1] > embeddings.shape[1]:
-                embeddings = embeddings + hier_emb[:, :embeddings.shape[1], :]
+                embeddings = embeddings + self.hier_scale * hier_emb[:, :embeddings.shape[1], :]
             else:
                 pad_len = embeddings.shape[1] - hier_emb.shape[1]
                 pad_zeros = torch.zeros(hier_emb.shape[0], pad_len, hier_emb.shape[2], device=hier_emb.device)
