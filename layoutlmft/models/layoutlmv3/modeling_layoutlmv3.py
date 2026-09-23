@@ -101,6 +101,8 @@ class LayoutLMv3Embeddings(nn.Module):
         self.y_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.coordinate_size)
         self.h_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.shape_size)
         self.w_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.shape_size)
+
+
         # NEW: Hierarchical position embeddings
         if getattr(config, "use_hierarchical_position_encoding", False):
             self.line_position_embeddings = nn.Embedding(
@@ -124,12 +126,15 @@ class LayoutLMv3Embeddings(nn.Module):
                     config.coordinate_size * 2,  # line + block
                     config.hidden_size
                 )
+
+            self.hier_scale = nn.Parameter(torch.zeros(1))
     
         else:
             self.line_position_embeddings = None
             self.block_position_embeddings = None
             self.column_position_embeddings = None
             self.hierarchical_proj = None
+            self.hier_scale = None
 
     def _calc_spatial_position_embeddings(self, bbox):
         try:
@@ -213,49 +218,45 @@ class LayoutLMv3Embeddings(nn.Module):
 
         embeddings = embeddings + spatial_position_embeddings
 
-        embeddings = self.LayerNorm(embeddings)
-        embeddings = self.dropout(embeddings)
-
         if self.line_position_embeddings is not None and line_ids is not None and block_ids is not None:
-            # Đảm bảo line_ids và block_ids có cùng shape với embeddings
+            # (Phần xử lý padding line_ids, block_ids giữ nguyên...)
             if line_ids.dim() == 2 and line_ids.shape[1] != embeddings.shape[1]:
-                # Nếu độ dài khác nhau, cắt hoặc pad
                 if line_ids.shape[1] > embeddings.shape[1]:
                     line_ids = line_ids[:, :embeddings.shape[1]]
                     block_ids = block_ids[:, :embeddings.shape[1]]
                 else:
-                    # Pad với -1
                     pad_len = embeddings.shape[1] - line_ids.shape[1]
                     line_ids = torch.cat([line_ids, torch.ones(line_ids.shape[0], pad_len, device=line_ids.device, dtype=line_ids.dtype) * -1], dim=1)
                     block_ids = torch.cat([block_ids, torch.ones(block_ids.shape[0], pad_len, device=block_ids.device, dtype=block_ids.dtype) * -1], dim=1)
             
-            # Clamp để tránh index out of range
             line_ids_clamped = torch.clamp(line_ids, 0, self.line_position_embeddings.num_embeddings - 1)
             block_ids_clamped = torch.clamp(block_ids, 0, self.block_position_embeddings.num_embeddings - 1)
             
             line_emb = self.line_position_embeddings(line_ids_clamped)
             block_emb = self.block_position_embeddings(block_ids_clamped)
+            
             if self.column_position_embeddings is not None and column_ids is not None:
                 column_ids_clamped = torch.clamp(column_ids, 0, self.column_position_embeddings.num_embeddings - 1)
                 column_emb = self.column_position_embeddings(column_ids_clamped)
-                column_weight = 0.3
-                column_emb = column_weight * column_emb
+                # XOÁ DÒNG NÀY: column_weight = 0.3
+                # XOÁ DÒNG NÀY: column_emb = column_weight * column_emb
                 concat_emb = torch.cat([line_emb, block_emb, column_emb], dim=-1)
             else:
                 concat_emb = torch.cat([line_emb, block_emb], dim=-1)
+            
             hier_emb = self.hierarchical_proj(concat_emb)
         
-            # Đảm bảo cùng shape
             if hier_emb.shape[1] == embeddings.shape[1]:
-                embeddings = embeddings + hier_emb
+                embeddings = embeddings + self.hier_scale * hier_emb
             elif hier_emb.shape[1] > embeddings.shape[1]:
-                embeddings = embeddings + hier_emb[:, :embeddings.shape[1], :]
+                embeddings = embeddings + self.hier_scale * hier_emb[:, :embeddings.shape[1], :]
             else:
                 pad_len = embeddings.shape[1] - hier_emb.shape[1]
                 pad_zeros = torch.zeros(hier_emb.shape[0], pad_len, hier_emb.shape[2], device=hier_emb.device)
                 hier_emb_padded = torch.cat([hier_emb, pad_zeros], dim=1)
-                embeddings = embeddings + hier_emb_padded
+                embeddings = embeddings + self.hier_scale * hier_emb_padded
         
+        # LayerNorm & Dropout chỉ gọi ĐÚNG 1 LẦN ở cuối cùng
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings

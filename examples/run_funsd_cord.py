@@ -289,12 +289,25 @@ def main():
 
     if isinstance(features[label_column_name].feature, ClassLabel):
         label_list = features[label_column_name].feature.names
-        # No need to convert the labels since they are already ints.
         label_to_id = {i: i for i in range(len(label_list))}
     else:
         label_list = get_label_list(datasets["train"][label_column_name])
         label_to_id = {l: i for i, l in enumerate(label_list)}
+        
     num_labels = len(label_list)
+
+    # THÊM KHỐI NÀY ĐỂ BẢO VỆ LOGIC BOUNDARY LOSS:
+    if getattr(model_args, "use_intra_line_boundary", False):
+        try:
+            assert label_list[0] == "O", "Nhãn đầu tiên phải là 'O'"
+            for i in range(1, len(label_list), 2):
+                if i + 1 < len(label_list):
+                    assert label_list[i].startswith("B-"), f"Nhãn {i} phải là B-, nhưng là {label_list[i]}"
+                    assert label_list[i+1].startswith("I-"), f"Nhãn {i+1} phải là I-, nhưng là {label_list[i+1]}"
+                    assert label_list[i][2:] == label_list[i+1][2:], "B- và I- không khớp loại entity"
+            logger.info("✅ Label list pass B-/I- parity check cho Boundary Loss.")
+        except AssertionError as e:
+            raise ValueError(f"Label list không đúng chuẩn B-/I- luân phiên. Cần sửa logic boundary loss. Chi tiết: {e}")
 
     # Load pretrained model and tokenizer
     #
