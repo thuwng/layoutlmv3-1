@@ -220,16 +220,14 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         h_geo = self.geo_head(text_hidden)
         h_semi = self.semi_head(text_hidden)
         
-        # ====== 1. RELATIVE GEOMETRY LOSS (FIXED) ======
+        # ====== 1. RELATIVE GEOMETRY LOSS (FIXED WITH POS_WEIGHT & TEMPERATURE) ======
         h_geo_norm = F.normalize(h_geo, dim=-1)
         # Cosine similarity matrix cho mọi cặp token: (B, L, L)
         geo_sim = torch.matmul(h_geo_norm, h_geo_norm.transpose(1, 2))
         
-        # Chuẩn hóa từ [-1, 1] về [0, 1] và ép chặt tránh sai số floating-point GPU
-        geo_sim_prob = torch.clamp((geo_sim + 1.0) / 2.0, min=0.0, max=1.0)
-        
         geo_loss = torch.tensor(0.0, device=device)
         geo_acc = 0.0
+        geo_baseline_acc = 0.0
         
         if line_ids is not None:
             line_ids = line_ids[:, :text_len]
@@ -245,11 +243,26 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             
             if pair_valid.sum() > 0:
                 target = same_line.float()
-                geo_loss = F.binary_cross_entropy(geo_sim_prob[pair_valid], target[pair_valid])
+                target_flat = target[pair_valid]
                 
-                # Tính Accuracy để Tracking
-                preds = (geo_sim_prob[pair_valid] > 0.5).float()
-                geo_acc = (preds == target[pair_valid]).float().mean().item()
+                # Tính toán trọng số cân bằng lớp (pos_weight) cho dữ liệu mất cân bằng nặng
+                n_pos = target_flat.sum().clamp(min=1.0)
+                n_neg = (target_flat.numel() - n_pos).clamp(min=1.0)
+                pos_weight = (n_neg / n_pos).clamp(max=30.0)  # Cáp để tránh weight quá cực đoan
+                
+                # Dùng temperature để kéo giãn cosine similarity trước khi qua hàm loss
+                temperature = 0.1
+                logit = geo_sim[pair_valid] / temperature
+                
+                geo_loss = F.binary_cross_entropy_with_logits(logit, target_flat, pos_weight=pos_weight)
+                
+                # Tính Accuracy dựa trên Logits / Sigmoid xác suất
+                probs = torch.sigmoid(logit)
+                preds = (probs > 0.5).float()
+                geo_acc = (preds == target_flat).float().mean().item()
+                
+                # Tính baseline đoán mù (luôn đoán lớp chiếm đa số)
+                baseline_acc = max(n_pos.item(), n_neg.item()) / target_flat.numel()
 
         # ====== 2. ORTHOGONALITY LOSS (1-to-1 Token Mapping) ======
         h_semi_norm = F.normalize(h_semi, dim=-1)
@@ -263,7 +276,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         else:
             orth_loss = torch.tensor(0.0, device=device)
             
-        return geo_loss, orth_loss, geo_acc
+        return geo_loss, orth_loss, geo_acc, geo_baseline_acc
 
     def forward(
         self,
@@ -364,7 +377,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             
             # Geometry Loss (Cần Warm-up trễ)
             if self.geo_head is not None:
-                geo_loss, orth_loss, geo_acc = self._compute_disentangle_loss(
+                geo_loss, orth_loss, geo_acc, geo_baseline_acc = self._compute_disentangle_loss(
                     text_hidden=sequence_output[:, :text_len, :],
                     line_ids=line_ids if line_ids is not None else None,
                     block_ids=block_ids if block_ids is not None else None,
@@ -404,6 +417,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             "geo_loss": round(geo_loss.item(), 4) if 'geo_loss' in locals() else 0.0,
             "orth_loss": round(orth_loss.item(), 4) if 'orth_loss' in locals() else 0.0,
             "geo_acc": round(geo_acc, 4) if 'geo_acc' in locals() else 0.0,
+            "geo_baseline_acc": round(geo_baseline_acc, 4) if 'geo_baseline_acc' in locals() else 0.0,
             "geo_ramp": round(geo_ramp, 4),
             "total_loss": round(loss.item(), 4) if loss is not None else 0.0,
         }
