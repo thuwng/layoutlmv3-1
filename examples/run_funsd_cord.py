@@ -12,6 +12,9 @@ import numpy as np
 from datasets import ClassLabel, load_dataset
 import evaluate
 
+import json
+from transformers import TrainerCallback
+
 import transformers
 import torch
 from layoutlmft.data import DataCollatorForKeyValueExtraction
@@ -38,6 +41,14 @@ from timm.data.constants import \
     IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from torchvision import transforms
 import torch
+
+class SecretTrackingCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if state.is_world_process_zero and logs is not None:
+            log_file = os.path.join(args.output_dir, "training_stealth_log.jsonl")
+            with open(log_file, "a", encoding="utf-8") as f:
+                logs_with_step = {**logs, "step": state.global_step, "epoch": state.epoch}
+                f.write(json.dumps(logs_with_step) + "\n")
 
 @dataclass
 class ModelArguments:
@@ -420,71 +431,79 @@ def main():
         column_ids_all = []
         
         # HÀM MỚI (PHASE 1 - FIXED): Anchor-based & 2D Box Merging
+        # HÀM MỚI (PHASE 1 - FIXED FINAL): Dựa trên Box Merging cấp độ Dòng (Line-level)
         def compute_geometry_ids(bboxes, y_thresh=10.0, x_thresh=50.0):
             n = len(bboxes)
             if n == 0:
                 return [], [], []
-            
+
             centers = [((b[0]+b[2])/2, (b[1]+b[3])/2) for b in bboxes]
             
-            # 1. Gom Dòng (Line) - Dùng Anchor cố định
-            order_y = sorted(range(n), key=lambda i: centers[i][1])
+            # 1. GOM DÒNG (Line) - Sắp xếp theo Y, gom nếu chênh lệch Y nhỏ
+            order_y = sorted(range(n), key=lambda i: (centers[i][1], centers[i][0]))
             line_ids = [0] * n
             cur_line = 0
-            anchor_y = centers[order_y[0]][1]
-            
-            for i in order_y:
-                cy = centers[i][1]
-                if abs(cy - anchor_y) > y_thresh:
+            prev_y = centers[order_y[0]][1]
+            for k in order_y:
+                if abs(centers[k][1] - prev_y) > y_thresh:
                     cur_line += 1
-                    anchor_y = cy  # CHỈ cập nhật neo khi sang dòng mới
-                line_ids[i] = cur_line
+                line_ids[k] = cur_line
+                prev_y = centers[k][1]
 
-            # 2. Gom Cột (Column) - Dùng Anchor cố định
+            # 2. GOM CỘT TOÀN CỤC (Global Column) - Không reset theo từng dòng
             order_x = sorted(range(n), key=lambda i: centers[i][0])
             col_ids = [0] * n
             cur_col = 0
-            anchor_x = centers[order_x[0]][0]
-            
-            for i in order_x:
-                cx = centers[i][0]
-                if abs(cx - anchor_x) > x_thresh:
+            prev_x = centers[order_x[0]][0]
+            for k in order_x:
+                if abs(centers[k][0] - prev_x) > x_thresh:
                     cur_col += 1
-                    anchor_x = cx  # CHỈ cập nhật neo khi sang cột mới
-                col_ids[i] = cur_col
+                col_ids[k] = cur_col
+                prev_x = centers[k][0]
 
-            # 3. Gom Khối (Block) - Gom nhóm 2D thực sự dựa trên Bounding Box
-            order_2d = sorted(range(n), key=lambda i: (centers[i][1], centers[i][0]))
-            block_ids = [0] * n
-            blocks = [] # Lưu tọa độ hộp bao của từng block: [min_x, min_y, max_x, max_y]
-            
-            for i in order_2d:
-                b = bboxes[i]
-                cx, cy = centers[i]
-                assigned_block = -1
-                
-                # Tìm xem token này có thuộc về block nào đã có không
-                for b_idx, block_box in enumerate(blocks):
-                    bx1, by1, bx2, by2 = block_box
-                    # Tính khoảng cách từ tâm token đến hộp bao của block
-                    dx = max(0, bx1 - cx, cx - bx2)
-                    dy = max(0, by1 - cy, cy - by2)
-                    
-                    if dx <= x_thresh * 2 and dy <= y_thresh * 2:
-                        assigned_block = b_idx
-                        break
-                
-                if assigned_block == -1:
-                    # Tạo block mới
-                    assigned_block = len(blocks)
-                    blocks.append(list(b))
+            # 3. GOM BLOCK (Gom các DÒNG thành ĐOẠN VĂN)
+            # Bước 3a: Tính Bounding Box bao trùm cho từng dòng
+            line_boxes = {}
+            for k in range(n):
+                l_id = line_ids[k]
+                b = bboxes[k]
+                if l_id not in line_boxes:
+                    line_boxes[l_id] = list(b)
                 else:
-                    # Nới rộng hộp bao của block hiện tại
-                    bx1, by1, bx2, by2 = blocks[assigned_block]
-                    blocks[assigned_block] = [min(bx1, b[0]), min(by1, b[1]), max(bx2, b[2]), max(by2, b[3])]
+                    line_boxes[l_id] = [
+                        min(line_boxes[l_id][0], b[0]),
+                        min(line_boxes[l_id][1], b[1]),
+                        max(line_boxes[l_id][2], b[2]),
+                        max(line_boxes[l_id][3], b[3]),
+                    ]
+            
+            # Bước 3b: Gom dòng thành Block dựa trên khoảng cách giữa 2 box của dòng
+            block_of_line = {}
+            cur_block = 0
+            sorted_lines = sorted(line_boxes.keys())
+            block_of_line[sorted_lines[0]] = cur_block
+            
+            for i in range(1, len(sorted_lines)):
+                curr_l = sorted_lines[i]
+                prev_l = sorted_lines[i-1]
                 
-                block_ids[i] = assigned_block
+                box_curr = line_boxes[curr_l]
+                box_prev = line_boxes[prev_l]
                 
+                # dy: Khoảng cách Y giữa mép trên dòng dưới và mép dưới dòng trên
+                dy = max(0, box_curr[1] - box_prev[3])
+                # dx: Khoảng cách X (đánh giá xem 2 dòng có thẳng hàng dọc / giao nhau không)
+                dx = max(0, max(box_prev[0], box_curr[0]) - min(box_prev[2], box_curr[2]))
+                
+                # Nếu cách xa nhau theo Y HOẶC hoàn toàn lệch nhau theo X -> Sang Block mới
+                if dy > y_thresh * 2 or dx > x_thresh:
+                    cur_block += 1
+                
+                block_of_line[curr_l] = cur_block
+            
+            # Phân phối block_id từ Dòng về lại từng Token
+            block_ids = [block_of_line[line_ids[k]] for k in range(n)]
+
             return line_ids, block_ids, col_ids
         
         for batch_index in range(len(tokenized_inputs["input_ids"])):
@@ -732,7 +751,7 @@ def main():
 
                 optimizer_grouped_parameters = [
                     {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
-                    {"params": new_params, "lr":5e-4} # Ép cứng LR lớn hơn cho module mới
+                    {"params": new_params, "lr": self.args.learning_rate * 5}  # Tương đương 5e-5 nếu lr gốc là 1e-5
                 ]
                 
                 self.optimizer = torch.optim.AdamW(
@@ -751,6 +770,7 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        callbacks=[SecretTrackingCallback()],
     )
     # Initialize our Trainer
     # trainer = Trainer(

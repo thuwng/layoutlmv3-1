@@ -196,9 +196,16 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         if line_ids is not None:
             valid = valid & (line_ids[:, :-1] >= 0) & (line_ids[:, :-1] == line_ids[:, 1:])
             
-        # 4. Xác định target cho Boundary Loss
-        # same_entity = True nếu cùng nhãn (O-O, I-I) HOẶC li là B-X (lẻ) và lj là I-X (chẵn, li+1)
-        same_entity = (li == lj) | ((li % 2 == 1) & (lj == li + 1))
+        # 4. Xác định target cho Boundary Loss chuẩn xác
+        is_O = (li == 0)  # O luôn có ID = 0 nhờ assert của bạn
+        is_B = (li % 2 == 1)
+        is_I = (li > 0) & (li % 2 == 0)
+
+        # Cùng entity khi: (O kề O) HOẶC (B kề I tương ứng) HOẶC (I kề I tương ứng)
+        same_entity = (is_O & (lj == 0)) | \
+                    (is_B & (lj == li + 1)) | \
+                    (is_I & (lj == li))
+
         target = (~same_entity).float()
         
         # 5. Tính Loss (BCE)
