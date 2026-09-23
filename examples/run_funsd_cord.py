@@ -764,18 +764,65 @@ def main():
         logger.info("*** Predict ***")
 
         predictions, labels, metrics = trainer.predict(test_dataset)
-        predictions = np.argmax(predictions, axis=2)
+        
+        # Đổi tên biến thành pred_argmax để giữ nguyên predictions gốc cho việc trích xuất
+        pred_argmax = np.argmax(predictions, axis=2)
 
-        # Remove ignored index (special tokens)
+        # Remove ignored index (special tokens) cho việc tính log gốc
         true_predictions = [
             [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
+            for prediction, label in zip(pred_argmax, labels)
         ]
 
         trainer.log_metrics("test", metrics)
         trainer.save_metrics("test", metrics)
 
-        # Save predictions
+        # =====================================================================
+        # THÊM MỚI: LIỆT KÊ LỖI DỰ ĐOÁN VÀ XUẤT RA CSV
+        # =====================================================================
+        import csv
+        error_output_file = os.path.join(training_args.output_dir, "detailed_prediction_errors.csv")
+        
+        # Chỉ ghi file bằng tiến trình chính (tránh lỗi xung đột khi chạy multi-GPU)
+        if trainer.is_world_process_zero():
+            with open(error_output_file, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                # Ghi header của file CSV
+                writer.writerow(["Sample_Index", "Token_Index", "Text", "Bounding_Box", "True_Label", "Predicted_Label", "Error_Type"])
+                
+                # Duyệt qua các mẫu trong tập test
+                for i, (pred, label) in enumerate(zip(pred_argmax, labels)):
+                    # Trích xuất dữ liệu thô từ test_dataset để đối chiếu
+                    input_ids = test_dataset[i]["input_ids"]
+                    bboxes = test_dataset[i]["bbox"]
+                    # Chuyển đổi input_ids thành các token chữ
+                    tokens = tokenizer.convert_ids_to_tokens(input_ids)
+                    
+                    for j, (p, l) in enumerate(zip(pred, label)):
+                        if l != -100:  # Bỏ qua padding, [CLS], [SEP]
+                            true_l = label_list[l]
+                            pred_l = label_list[p]
+                            
+                            # Nếu dự đoán sai thì tiến hành ghi lỗi
+                            if true_l != pred_l:
+                                # Làm sạch token (loại bỏ ký tự đặc biệt của tokenizer như 'Ġ' hoặc ' ')
+                                token_text = tokens[j].replace("Ġ", "").replace(" ", "")
+                                bbox = bboxes[j]
+                                
+                                # Phân loại nguyên nhân lỗi
+                                if true_l == "O" and pred_l != "O":
+                                    err_type = "False Positive (Nhận diện thừa)"
+                                elif true_l != "O" and pred_l == "O":
+                                    err_type = "False Negative (Bỏ sót)"
+                                else:
+                                    err_type = "Misclassification (Nhầm nhãn)"
+                                    
+                                writer.writerow([i, j, token_text, bbox, true_l, pred_l, err_type])
+            
+            logger.info(f"Đã lưu danh sách lỗi dự đoán chi tiết tại: {error_output_file}")
+        # =====================================================================
+
+        # Save predictions (Giữ nguyên đoạn code ghi file .txt cũ)
         output_test_predictions_file = os.path.join(training_args.output_dir, "test_predictions.txt")
         if trainer.is_world_process_zero():
             with open(output_test_predictions_file, "w") as writer:
