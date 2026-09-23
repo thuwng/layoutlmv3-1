@@ -65,7 +65,7 @@ do
         --max_block_position 30 \
         --use_column_encoding True \
         --max_column_position 8 \
-        --lambda_bound_init 0.1
+        --lambda_bound_init 0.01
 done
 
 echo ""
