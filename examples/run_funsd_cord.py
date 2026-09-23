@@ -69,6 +69,11 @@ class SecretTrackingCallback(TrainerCallback):
                 }
                 f.write(json.dumps(record) + "\n")
 
+class StepInjectorCallback(TrainerCallback):
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        target = model.module if hasattr(model, "module") else model
+        target.current_step = state.global_step
+
 @dataclass
 class ModelArguments:
     """
@@ -138,6 +143,10 @@ class ModelArguments:
     lambda_orth_init: float = field(
         default=0.1,
         metadata={"help": "Initial weight for orthogonality loss"}
+    )
+    geo_warmup_steps: int = field(
+        default=200,
+        metadata={"help": "Số step chờ trước khi cộng geometry và orthogonality loss"}
     )
 
 
@@ -367,6 +376,7 @@ def main():
         use_semantic_geometry_disentangle=model_args.use_semantic_geometry_disentangle,
         lambda_geo_init=model_args.lambda_geo_init,
         lambda_orth_init=model_args.lambda_orth_init,
+        geo_warmup_steps=model_args.geo_warmup_steps,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -826,7 +836,8 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[SecretTrackingCallback()],
+        callbacks=[SecretTrackingCallback(),
+        StepInjectorCallback()],
     )
     # Initialize our Trainer
     # trainer = Trainer(

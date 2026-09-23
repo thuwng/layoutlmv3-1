@@ -215,73 +215,55 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         denom = valid.float().sum().clamp(min=1.0)
         return loss_per_pair.sum() / denom
 
-    def _compute_disentangle_loss(self, text_hidden, line_ids, block_ids, 
-                                attention_mask, text_len):
+    def _compute_disentangle_loss(self, text_hidden, line_ids, block_ids, attention_mask, text_len):
         device = text_hidden.device
-        B = text_hidden.shape[0]
-        
-        # Cắt line_ids, block_ids về text_len
-        if line_ids is not None and line_ids.shape[1] > text_len:
-            line_ids = line_ids[:, :text_len]
-        if block_ids is not None and block_ids.shape[1] > text_len:
-            block_ids = block_ids[:, :text_len]
-        
         h_geo = self.geo_head(text_hidden)
         h_semi = self.semi_head(text_hidden)
         
-        # ====== GEOMETRY LOSS ======
+        # ====== 1. RELATIVE GEOMETRY LOSS (FIXED) ======
+        h_geo_norm = F.normalize(h_geo, dim=-1)
+        # Cosine similarity matrix cho mọi cặp token: (B, L, L)
+        geo_sim = torch.matmul(h_geo_norm, h_geo_norm.transpose(1, 2))
+        
+        # Chuẩn hóa từ [-1, 1] về [0, 1] để dùng Binary Cross Entropy
+        geo_sim_prob = (geo_sim + 1.0) / 2.0
+        
         geo_loss = torch.tensor(0.0, device=device)
+        geo_acc = 0.0
         
         if line_ids is not None:
-            line_logits = self.geo_line_classifier(h_geo)
-            block_logits = self.geo_block_classifier(h_geo)
+            line_ids = line_ids[:, :text_len]
+            # Ma trận target: 1 nếu cùng line_id, 0 nếu khác
+            same_line = (line_ids.unsqueeze(1) == line_ids.unsqueeze(2)) & (line_ids.unsqueeze(1) >= 0)
             
-            valid_mask = (line_ids >= 0) & (block_ids >= 0)
             if attention_mask is not None:
-                text_attention_mask = attention_mask[:, :text_len]
-                valid_mask = valid_mask & (text_attention_mask == 1)
+                valid_mask = attention_mask[:, :text_len].bool()
+            else:
+                valid_mask = torch.ones((text_hidden.shape[0], text_len), dtype=torch.bool, device=device)
+                
+            pair_valid = valid_mask.unsqueeze(1) & valid_mask.unsqueeze(2)
             
-            if valid_mask.sum() > 0:
-                line_ids_clamped = torch.clamp(line_ids, 0, self.geo_line_classifier.out_features - 1)
-                block_ids_clamped = torch.clamp(block_ids, 0, self.geo_block_classifier.out_features - 1)
+            if pair_valid.sum() > 0:
+                target = same_line.float()
+                geo_loss = F.binary_cross_entropy(geo_sim_prob[pair_valid], target[pair_valid])
                 
-                geo_loss_line = F.cross_entropy(
-                    line_logits[valid_mask], 
-                    line_ids_clamped[valid_mask]
-                )
-                geo_loss_block = F.cross_entropy(
-                    block_logits[valid_mask],
-                    block_ids_clamped[valid_mask]
-                )
-                geo_loss = geo_loss_line + geo_loss_block
-                
-                # ====== KIỂM TRA NaN ======
-                if torch.isnan(geo_loss) or torch.isinf(geo_loss):
-                    geo_loss = torch.tensor(0.0, device=device)
-        
-        # ====== ORTHOGONALITY LOSS (FIXED: 1-to-1 Token Mapping) ======
-        h_geo_norm = F.normalize(h_geo, dim=-1)
+                # Tính Accuracy để Tracking
+                preds = (geo_sim_prob[pair_valid] > 0.5).float()
+                geo_acc = (preds == target[pair_valid]).float().mean().item()
+
+        # ====== 2. ORTHOGONALITY LOSS (1-to-1 Token Mapping) ======
         h_semi_norm = F.normalize(h_semi, dim=-1)
+        cos_sim_orth = (h_geo_norm * h_semi_norm).sum(dim=-1)
         
-        # Tính Cosine Sim giữa geo và semi của CÙNG MỘT token (B, L)
-        cos_sim = (h_geo_norm * h_semi_norm).sum(dim=-1)
+        valid_mask_orth = attention_mask[:, :text_len].bool() if attention_mask is not None else torch.ones_like(cos_sim_orth, dtype=torch.bool)
         
-        if attention_mask is not None:
-            valid_mask = attention_mask[:, :text_len].bool()
-        else:
-            valid_mask = torch.ones_like(cos_sim, dtype=torch.bool)
-        
-        # Tính trung bình bình phương Cosine Similarity trên các token hợp lệ
-        valid_cos_sim = cos_sim[valid_mask]
+        valid_cos_sim = cos_sim_orth[valid_mask_orth]
         if valid_cos_sim.numel() > 0:
             orth_loss = (valid_cos_sim ** 2).mean()
         else:
             orth_loss = torch.tensor(0.0, device=device)
             
-        if torch.isnan(orth_loss) or torch.isinf(orth_loss):
-            orth_loss = torch.tensor(0.0, device=device)
-        
-        return geo_loss, orth_loss
+        return geo_loss, orth_loss, geo_acc
 
     def forward(
         self,
@@ -363,11 +345,13 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
 
         pooled_sequence = self.dropout(pooled_sequence)
         logits = self.classifier(pooled_sequence)
-        # ====== TÍNH CÁC LOSS PHỤ ======
-        aux_loss = torch.tensor(0.0, device=logits.device)
 
+        # ====== TÍNH CÁC LOSS PHỤ CÓ WARM-UP ======
+        aux_loss = torch.tensor(0.0, device=logits.device)
+        geo_ramp = 0.0
+        
         if labels is not None:
-            # ====== INTRA-LINE BOUNDARY LOSS ======
+            # Boundary Loss (không cần warmup)
             if self.boundary_classifier is not None:
                 boundary_loss = self._compute_boundary_loss(
                     text_hidden=sequence_output[:, :text_len, :],
@@ -378,16 +362,23 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 )
                 aux_loss = aux_loss + self.lambda_bound * boundary_loss
             
-            # ====== SEMANTIC-GEOMETRY DISENTANGLE LOSS ======
+            # Geometry Loss (Cần Warm-up trễ)
             if self.geo_head is not None:
-                geo_loss, orth_loss = self._compute_disentangle_loss(
+                geo_loss, orth_loss, geo_acc = self._compute_disentangle_loss(
                     text_hidden=sequence_output[:, :text_len, :],
                     line_ids=line_ids if line_ids is not None else None,
                     block_ids=block_ids if block_ids is not None else None,
                     attention_mask=attention_mask,
                     text_len=text_len,
                 )
-                aux_loss = aux_loss + self.lambda_geo * geo_loss + self.lambda_orth * orth_loss
+                
+                # Tính dốc ramp dựa trên current_step được truyền từ callback
+                current_step = getattr(self, "current_step", 0)
+                geo_warmup_steps = getattr(self.config, "geo_warmup_steps", 200)
+                geo_ramp = min(1.0, max(0.0, (current_step - geo_warmup_steps) / 100.0))
+                
+                aux_loss = aux_loss + geo_ramp * (self.lambda_geo * geo_loss + self.lambda_orth * orth_loss)
+
         loss = None
         ce_loss_val = 0.0
         
@@ -412,10 +403,9 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             "boundary_loss": round(boundary_loss.item(), 4) if 'boundary_loss' in locals() else 0.0,
             "geo_loss": round(geo_loss.item(), 4) if 'geo_loss' in locals() else 0.0,
             "orth_loss": round(orth_loss.item(), 4) if 'orth_loss' in locals() else 0.0,
+            "geo_acc": round(geo_acc, 4) if 'geo_acc' in locals() else 0.0,
+            "geo_ramp": round(geo_ramp, 4),
             "total_loss": round(loss.item(), 4) if loss is not None else 0.0,
-            "lam_bnd": getattr(self, "lambda_bound", 0.0),
-            "lam_geo": getattr(self, "lambda_geo", 0.0),
-            "lam_orth": getattr(self, "lambda_orth", 0.0)
         }
 
         if not return_dict:

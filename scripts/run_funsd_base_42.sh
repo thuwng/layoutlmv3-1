@@ -53,4 +53,5 @@ rm -rf "$OUT"
   --geo_x_threshold 50.0 \
   --use_semantic_geometry_disentangle True \
   --lambda_orth_init 0.005 \
-  --lambda_geo_init 0.05
+  --lambda_geo_init 0.05 \
+  --geo_warmup_steps 200
