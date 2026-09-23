@@ -419,67 +419,71 @@ def main():
         block_ids_all = []   # NEW
         column_ids_all = []
         
-        # HÀM MỚI (PHASE 1): Clustering 2D có sort trước
+        # HÀM MỚI (PHASE 1 - FIXED): Anchor-based & 2D Box Merging
         def compute_geometry_ids(bboxes, y_thresh=10.0, x_thresh=50.0):
             n = len(bboxes)
             if n == 0:
                 return [], [], []
             
-            # Sort toàn bộ box theo (y_center, x_center)
-            order = sorted(range(n), key=lambda i: ((bboxes[i][1] + bboxes[i][3]) / 2,
-                                                    (bboxes[i][0] + bboxes[i][2]) / 2))
+            centers = [((b[0]+b[2])/2, (b[1]+b[3])/2) for b in bboxes]
             
-            # --- Gom dòng (Line) ---
-            line_of_sorted = [0] * n
-            cur_line = 0
-            prev_y = (bboxes[order[0]][1] + bboxes[order[0]][3]) / 2
-            for k in range(1, n):
-                y = (bboxes[order[k]][1] + bboxes[order[k]][3]) / 2
-                if abs(y - prev_y) > y_thresh:
-                    cur_line += 1
-                line_of_sorted[k] = cur_line
-                prev_y = y
-
-            # --- Gom cột (Column) trong từng dòng ---
-            col_of_sorted = [0] * n
-            idx_by_line = {}
-            for k, ln in enumerate(line_of_sorted):
-                idx_by_line.setdefault(ln, []).append(k)
-                
-            for ln, ks in idx_by_line.items():
-                ks_sorted = sorted(ks, key=lambda k: (bboxes[order[k]][0] + bboxes[order[k]][2]) / 2)
-                cur_col = 0
-                prev_x = None
-                for k in ks_sorted:
-                    x = (bboxes[order[k]][0] + bboxes[order[k]][2]) / 2
-                    if prev_x is not None and abs(x - prev_x) > x_thresh:
-                        cur_col += 1
-                    col_of_sorted[k] = cur_col
-                    prev_x = x
-
-            # --- Gom khối (Block) dựa trên khoảng cách 2D ---
-            block_of_sorted = [0] * n
-            cur_block = 0
-            prev_center = None
-            for k in range(n):
-                cx = (bboxes[order[k]][0] + bboxes[order[k]][2]) / 2
-                cy = (bboxes[order[k]][1] + bboxes[order[k]][3]) / 2
-                if prev_center is not None:
-                    dx, dy = abs(cx - prev_center[0]), abs(cy - prev_center[1])
-                    # Nới lỏng threshold cho block (union các dòng gần nhau)
-                    if dx > x_thresh * 3 or dy > y_thresh * 3:
-                        cur_block += 1
-                block_of_sorted[k] = cur_block
-                prev_center = (cx, cy)
-
-            # --- Trả ngược về thứ tự gốc của dataset ---
+            # 1. Gom Dòng (Line) - Dùng Anchor cố định
+            order_y = sorted(range(n), key=lambda i: centers[i][1])
             line_ids = [0] * n
-            block_ids = [0] * n
+            cur_line = 0
+            anchor_y = centers[order_y[0]][1]
+            
+            for i in order_y:
+                cy = centers[i][1]
+                if abs(cy - anchor_y) > y_thresh:
+                    cur_line += 1
+                    anchor_y = cy  # CHỈ cập nhật neo khi sang dòng mới
+                line_ids[i] = cur_line
+
+            # 2. Gom Cột (Column) - Dùng Anchor cố định
+            order_x = sorted(range(n), key=lambda i: centers[i][0])
             col_ids = [0] * n
-            for k, orig_i in enumerate(order):
-                line_ids[orig_i] = line_of_sorted[k]
-                block_ids[orig_i] = block_of_sorted[k]
-                col_ids[orig_i] = col_of_sorted[k]
+            cur_col = 0
+            anchor_x = centers[order_x[0]][0]
+            
+            for i in order_x:
+                cx = centers[i][0]
+                if abs(cx - anchor_x) > x_thresh:
+                    cur_col += 1
+                    anchor_x = cx  # CHỈ cập nhật neo khi sang cột mới
+                col_ids[i] = cur_col
+
+            # 3. Gom Khối (Block) - Gom nhóm 2D thực sự dựa trên Bounding Box
+            order_2d = sorted(range(n), key=lambda i: (centers[i][1], centers[i][0]))
+            block_ids = [0] * n
+            blocks = [] # Lưu tọa độ hộp bao của từng block: [min_x, min_y, max_x, max_y]
+            
+            for i in order_2d:
+                b = bboxes[i]
+                cx, cy = centers[i]
+                assigned_block = -1
+                
+                # Tìm xem token này có thuộc về block nào đã có không
+                for b_idx, block_box in enumerate(blocks):
+                    bx1, by1, bx2, by2 = block_box
+                    # Tính khoảng cách từ tâm token đến hộp bao của block
+                    dx = max(0, bx1 - cx, cx - bx2)
+                    dy = max(0, by1 - cy, cy - by2)
+                    
+                    if dx <= x_thresh * 2 and dy <= y_thresh * 2:
+                        assigned_block = b_idx
+                        break
+                
+                if assigned_block == -1:
+                    # Tạo block mới
+                    assigned_block = len(blocks)
+                    blocks.append(list(b))
+                else:
+                    # Nới rộng hộp bao của block hiện tại
+                    bx1, by1, bx2, by2 = blocks[assigned_block]
+                    blocks[assigned_block] = [min(bx1, b[0]), min(by1, b[1]), max(bx2, b[2]), max(by2, b[3])]
+                
+                block_ids[i] = assigned_block
                 
             return line_ids, block_ids, col_ids
         
