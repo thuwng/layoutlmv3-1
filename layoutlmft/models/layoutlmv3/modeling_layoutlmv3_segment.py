@@ -225,8 +225,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         # Cosine similarity matrix cho mọi cặp token: (B, L, L)
         geo_sim = torch.matmul(h_geo_norm, h_geo_norm.transpose(1, 2))
         
-        # Chuẩn hóa từ [-1, 1] về [0, 1] để dùng Binary Cross Entropy
-        geo_sim_prob = (geo_sim + 1.0) / 2.0
+        # Chuẩn hóa từ [-1, 1] về [0, 1] và ép chặt tránh sai số floating-point GPU
+        geo_sim_prob = torch.clamp((geo_sim + 1.0) / 2.0, min=0.0, max=1.0)
         
         geo_loss = torch.tensor(0.0, device=device)
         geo_acc = 0.0
