@@ -63,10 +63,11 @@ do
         --max_line_position 100 \
         --max_block_position 30 \
         --use_column_encoding True \
-        --max_column_position 8 \
+        --max_column_position 50 \
         --lambda_bound_init 0.01 \
         --geo_y_threshold 10.0 \
         --geo_x_threshold 50.0 \
+        --use_semantic_geometry_disentangle True \
         --lambda_orth_init 0.005 \
         --lambda_geo_init 0.05
 done

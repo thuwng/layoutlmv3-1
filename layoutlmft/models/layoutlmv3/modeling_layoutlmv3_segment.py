@@ -259,22 +259,25 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 if torch.isnan(geo_loss) or torch.isinf(geo_loss):
                     geo_loss = torch.tensor(0.0, device=device)
         
-        # ====== ORTHOGONALITY LOSS ======
+        # ====== ORTHOGONALITY LOSS (FIXED: 1-to-1 Token Mapping) ======
         h_geo_norm = F.normalize(h_geo, dim=-1)
         h_semi_norm = F.normalize(h_semi, dim=-1)
         
-        cos_sim = torch.matmul(h_geo_norm, h_semi_norm.transpose(1, 2))
+        # Tính Cosine Sim giữa geo và semi của CÙNG MỘT token (B, L)
+        cos_sim = (h_geo_norm * h_semi_norm).sum(dim=-1)
         
         if attention_mask is not None:
-            text_attention_mask = attention_mask[:, :text_len]
-            valid_mask_2d = text_attention_mask.bool()
-            pair_mask = valid_mask_2d.unsqueeze(1) & valid_mask_2d.unsqueeze(2)
-            cos_sim = cos_sim * pair_mask.float()
+            valid_mask = attention_mask[:, :text_len].bool()
+        else:
+            valid_mask = torch.ones_like(cos_sim, dtype=torch.bool)
         
-        n_valid_pairs = pair_mask.float().sum().clamp(min=1.0)
-        orth_loss = (cos_sim ** 2).sum() / n_valid_pairs
-        
-        # ====== KIỂM TRA NaN ======
+        # Tính trung bình bình phương Cosine Similarity trên các token hợp lệ
+        valid_cos_sim = cos_sim[valid_mask]
+        if valid_cos_sim.numel() > 0:
+            orth_loss = (valid_cos_sim ** 2).mean()
+        else:
+            orth_loss = torch.tensor(0.0, device=device)
+            
         if torch.isnan(orth_loss) or torch.isinf(orth_loss):
             orth_loss = torch.tensor(0.0, device=device)
         
@@ -386,6 +389,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 )
                 aux_loss = aux_loss + self.lambda_geo * geo_loss + self.lambda_orth * orth_loss
         loss = None
+        ce_loss_val = 0.0
+        
         if labels is not None:
             loss_fct = CrossEntropyLoss()
             if attention_mask is not None:
@@ -394,11 +399,24 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 active_labels = torch.where(
                     active_loss, labels.view(-1), torch.tensor(loss_fct.ignore_index).type_as(labels)
                 )
-                loss = loss_fct(active_logits, active_labels)
+                ce_loss = loss_fct(active_logits, active_labels)
             else:
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+                ce_loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
 
-            loss = loss + aux_loss
+            ce_loss_val = ce_loss.item()
+            loss = ce_loss + aux_loss
+
+        # ====== LƯU VẾT CÁC THÀNH PHẦN LOSS ĐỂ TRACKING ======
+        self.loss_tracker = {
+            "ce_loss": round(ce_loss_val, 4),
+            "boundary_loss": round(boundary_loss.item(), 4) if 'boundary_loss' in locals() else 0.0,
+            "geo_loss": round(geo_loss.item(), 4) if 'geo_loss' in locals() else 0.0,
+            "orth_loss": round(orth_loss.item(), 4) if 'orth_loss' in locals() else 0.0,
+            "total_loss": round(loss.item(), 4) if loss is not None else 0.0,
+            "lam_bnd": getattr(self, "lambda_bound", 0.0),
+            "lam_geo": getattr(self, "lambda_geo", 0.0),
+            "lam_orth": getattr(self, "lambda_orth", 0.0)
+        }
 
         if not return_dict:
             output = (logits,) + outputs[2:]

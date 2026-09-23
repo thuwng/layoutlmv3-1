@@ -45,10 +45,29 @@ import torch
 class SecretTrackingCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if state.is_world_process_zero and logs is not None:
-            log_file = os.path.join(args.output_dir, "training_stealth_log.jsonl")
+            model = kwargs.get('model', None)
+            optimizer = kwargs.get('optimizer', None)
+            
+            # Xử lý trường hợp DDP (model được wrap trong module)
+            loss_tracker = getattr(model, "loss_tracker", {}) if model else {}
+            if not loss_tracker and hasattr(model, "module"):
+                loss_tracker = getattr(model.module, "loss_tracker", {})
+                
+            # Trích xuất Learning Rate thực tế từ Optimizer
+            lr_backbone = optimizer.param_groups[0]['lr'] if optimizer else 0.0
+            lr_new = optimizer.param_groups[1]['lr'] if optimizer and len(optimizer.param_groups) > 1 else 0.0
+            
+            log_file = os.path.join(args.output_dir, "loss_components.jsonl")
             with open(log_file, "a", encoding="utf-8") as f:
-                logs_with_step = {**logs, "step": state.global_step, "epoch": state.epoch}
-                f.write(json.dumps(logs_with_step) + "\n")
+                record = {
+                    "step": state.global_step, 
+                    "epoch": round(state.epoch, 2),
+                    "lr_backbone": lr_backbone,
+                    "lr_new": lr_new,
+                    **logs,
+                    **loss_tracker
+                }
+                f.write(json.dumps(record) + "\n")
 
 @dataclass
 class ModelArguments:
@@ -430,7 +449,6 @@ def main():
         block_ids_all = []   # NEW
         column_ids_all = []
         
-        # HÀM MỚI (PHASE 1 - FIXED): Anchor-based & 2D Box Merging
         # HÀM MỚI (PHASE 1 - FIXED FINAL): Dựa trên Box Merging cấp độ Dòng (Line-level)
         def compute_geometry_ids(bboxes, y_thresh=10.0, x_thresh=50.0):
             n = len(bboxes)
@@ -716,9 +734,10 @@ def main():
         
         # Chỉ lưu vào file trong thư mục output (KHÔNG in ra màn hình log)
         report_file_path = os.path.join(training_args.output_dir, "eval_classification_report.txt")
-        with open(report_file_path, "w", encoding="utf-8") as f:
+        # Thay "w" bằng "a" để giữ lại lịch sử các epoch
+        with open(report_file_path, "a", encoding="utf-8") as f:
             f.write("="*50 + "\n")
-            f.write("📊 THỐNG KÊ LỖI / CHI TIẾT TỪNG NHÃN (EVAL MỚI NHẤT)\n")
+            f.write(f"📊 REPORT TẠI BƯỚC ĐÁNH GIÁ (Append Mode)\n")
             f.write("="*50 + "\n")
             f.write(report + "\n")
 
@@ -744,14 +763,51 @@ def main():
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
-                # Nhóm 1: Các tham số thuộc backbone LayoutLMv3
-                backbone_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and p.requires_grad]
-                # Nhóm 2: Các tham số mới (segment_context, classifier, is_first_token_embedding, gate)
-                new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
+                backbone_params = []
+                new_params = []
+                new_names = []
+                
+                # Danh sách TƯỜNG MINH các module mới cần LR cao
+                NEW_MODULE_PREFIXES = (
+                    "segment_context",
+                    "boundary_classifier",
+                    "is_first_token_embedding",
+                    "layoutlmv3.embeddings.line_position_embeddings",
+                    "layoutlmv3.embeddings.block_position_embeddings",
+                    "layoutlmv3.embeddings.column_position_embeddings",
+                    "layoutlmv3.embeddings.hierarchical_proj",
+                    "layoutlmv3.embeddings.column_scale",
+                    "layoutlmv3.embeddings.hier_scale",
+                    "geo_head",
+                    "semi_head",
+                    "geo_line_classifier",
+                    "geo_block_classifier",
+                )
+                
+                for n, p in self.model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if n.startswith(NEW_MODULE_PREFIXES):
+                        new_params.append(p)
+                        new_names.append(n)
+                    else:
+                        # Backbone và classifier thuộc về nhóm này
+                        backbone_params.append(p)
+                        
+                # Log kiểm chứng khi chạy
+                if self.is_world_process_zero():
+                    print("\n" + "="*60)
+                    print(f"⚙️ OPTIMIZER PARAMETER GROUPING:")
+                    print(f"   - Backbone + Classifier: {len(backbone_params)} tensors")
+                    print(f"   - Custom Modules (LR x5): {len(new_params)} tensors")
+                    print("   - Danh sách Custom Params (mẫu):")
+                    for name in new_names[:10]:
+                        print(f"     > {name}")
+                    print("="*60 + "\n")
 
                 optimizer_grouped_parameters = [
-                    {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
-                    {"params": new_params, "lr": self.args.learning_rate * 5}  # Tương đương 5e-5 nếu lr gốc là 1e-5
+                    {"params": backbone_params, "lr": self.args.learning_rate}, 
+                    {"params": new_params, "lr": self.args.learning_rate * 5} 
                 ]
                 
                 self.optimizer = torch.optim.AdamW(
@@ -760,7 +816,7 @@ def main():
                     eps=self.args.adam_epsilon,
                 )
             return self.optimizer
-
+        
     # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
     trainer = CustomTrainer(
         model=model,
