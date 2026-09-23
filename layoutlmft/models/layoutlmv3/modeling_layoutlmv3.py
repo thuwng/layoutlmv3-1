@@ -101,6 +101,8 @@ class LayoutLMv3Embeddings(nn.Module):
         self.y_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.coordinate_size)
         self.h_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.shape_size)
         self.w_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.shape_size)
+
+
         # NEW: Hierarchical position embeddings
         if getattr(config, "use_hierarchical_position_encoding", False):
             self.line_position_embeddings = nn.Embedding(
@@ -124,12 +126,15 @@ class LayoutLMv3Embeddings(nn.Module):
                     config.coordinate_size * 2,  # line + block
                     config.hidden_size
                 )
+
+            self.hier_scale = nn.Parameter(torch.zeros(1))
     
         else:
             self.line_position_embeddings = None
             self.block_position_embeddings = None
             self.column_position_embeddings = None
             self.hierarchical_proj = None
+            self.hier_scale = None
 
     def _calc_spatial_position_embeddings(self, bbox):
         try:
@@ -249,7 +254,7 @@ class LayoutLMv3Embeddings(nn.Module):
                 pad_len = embeddings.shape[1] - hier_emb.shape[1]
                 pad_zeros = torch.zeros(hier_emb.shape[0], pad_len, hier_emb.shape[2], device=hier_emb.device)
                 hier_emb_padded = torch.cat([hier_emb, pad_zeros], dim=1)
-                embeddings = embeddings + hier_emb_padded
+                embeddings = embeddings + self.hier_scale * hier_emb_padded
         
         # LayerNorm & Dropout chỉ gọi ĐÚNG 1 LẦN ở cuối cùng
         embeddings = self.LayerNorm(embeddings)
