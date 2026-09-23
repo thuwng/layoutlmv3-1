@@ -32,7 +32,7 @@ rm -rf "$OUT"
   --learning_rate 1e-5 \
   --warmup_ratio 0.1 \
   --per_device_train_batch_size 2 \
-  --gradient_accumulation_steps 8 \
+  --gradient_accumulation_steps 4 \
   --dataloader_num_workers 4 \
   --remove_unused_columns False \
   --report_to none \
@@ -40,3 +40,4 @@ rm -rf "$OUT"
   --seed "$SEED" \
   --overwrite_output_dir \
   --overwrite_cache
+  
