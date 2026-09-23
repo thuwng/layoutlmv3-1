@@ -38,7 +38,6 @@ rm -rf "$OUT"
   --dataloader_num_workers 4 \
   --remove_unused_columns False \
   --use_intra_line_boundary True \
-  --lambda_bound_init 0.1 \
   --report_to none \
   --run_name "FUNSD-LR-Split-seed${SEED}" \
   --seed "$SEED" \
