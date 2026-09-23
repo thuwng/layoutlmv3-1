@@ -24,6 +24,8 @@ rm -rf "$OUT"
   --use_segment_head \
   --model_name_or_path /kaggle/working/layoutlmv3-base-local \
   --output_dir "$OUT" \
+  --segment_level_layout 1 \
+  --visual_embed 1 \
   --input_size 224 \
   --max_steps 1000 \
   --save_steps 1000 \
@@ -35,8 +37,17 @@ rm -rf "$OUT"
   --gradient_accumulation_steps 4 \
   --dataloader_num_workers 4 \
   --remove_unused_columns False \
+  --use_intra_line_boundary True \
+  --lambda_bound_init 0.1 \
   --report_to none \
   --run_name "FUNSD-LR-Split-seed${SEED}" \
   --seed "$SEED" \
   --overwrite_output_dir \
-  --overwrite_cache
+  --overwrite_cache \
+  --use_hierarchical_position_encoding \
+  --max_line_position 100 \
+  --max_block_position 30 \
+  --use_column_encoding True \
+  --max_column_position 8 \
+  --use_intra_line_boundary True \
+  --lambda_bound_init 0.1
