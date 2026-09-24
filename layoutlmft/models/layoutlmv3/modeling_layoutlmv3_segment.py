@@ -234,7 +234,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 geo_acc = (preds == target_flat).float().mean().item()
                 
                 # Tính baseline đoán mù (luôn đoán lớp chiếm đa số)
-                baseline_acc = max(n_pos.item(), n_neg.item()) / target_flat.numel()
+            geo_baseline_acc = max(n_pos.item(), n_neg.item()) / target_flat.numel()
 
         # ====== 2. ORTHOGONALITY LOSS (1-to-1 Token Mapping) ======
         h_semi_norm = F.normalize(h_semi, dim=-1)
@@ -353,7 +353,15 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         ce_loss_val = 0.0
         
         if labels is not None:
-            loss_fct = CrossEntropyLoss()
+            # Lấy class_weights từ config (đã được truyền từ run_funsd_cord.py)
+            class_weights = getattr(self.config, "class_weights", None)
+            if class_weights is not None:
+                # Chuyển list thành tensor và đưa lên cùng device với logits
+                class_weights_tensor = torch.tensor(class_weights, dtype=torch.float, device=logits.device)
+                loss_fct = CrossEntropyLoss(weight=class_weights_tensor)
+            else:
+                loss_fct = CrossEntropyLoss()
+
             if attention_mask is not None:
                 active_loss = attention_mask.view(-1) == 1
                 active_logits = logits.view(-1, self.num_labels)

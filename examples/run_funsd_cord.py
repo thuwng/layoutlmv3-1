@@ -27,6 +27,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
     set_seed,
+    EarlyStoppingCallback,
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
@@ -352,6 +353,26 @@ def main():
             logger.info("✅ Label list pass B-/I- parity check cho Boundary Loss.")
         except AssertionError as e:
             raise ValueError(f"Label list không đúng chuẩn B-/I- luân phiên. Cần sửa logic boundary loss. Chi tiết: {e}")
+
+    # TÍNH TOÁN CLASS WEIGHTS ĐỂ CHỐNG MẤT CÂN BẰNG LỚP (Đặc biệt cho HEADER)
+    if training_args.do_train:
+        # Lấy toàn bộ nhãn từ tập train
+        all_train_labels = [label for seq in datasets["train"][label_column_name] for label in seq]
+        label_counts = np.bincount(all_train_labels, minlength=num_labels)
+
+        # Tính trọng số: nghịch đảo tần suất. Cộng 1e-5 để tránh chia cho 0
+        total_labels = sum(label_counts)
+        class_weights = total_labels / (num_labels * (label_counts + 1e-5))
+
+        # Giảm trọng số của lớp "O" (thường là index 0) xuống thấp hơn để tránh False Positive tràn lan
+        if "O" in label_list:
+            idx_O = label_list.index("O")
+            class_weights[idx_O] = class_weights[idx_O] * 0.1 # Phạt nhẹ hơn nhiều cho nhãn O
+
+        class_weights_list = class_weights.tolist()
+        logger.info(f"📊 Class weights calculated: {dict(zip(label_list, class_weights_list))}")
+    else:
+        class_weights_list = None
 
     # Load pretrained model and tokenizer
     #
@@ -765,47 +786,37 @@ def main():
                 backbone_params = []
                 new_params = []
                 gate_params = []
-                
+
                 NEW_MODULE_PREFIXES = (
-                    "segment_context.layers",
-                    "boundary_classifier",
-                    "layoutlmv3.embeddings.line_position_embeddings",
-                    "layoutlmv3.embeddings.block_position_embeddings",
-                    "layoutlmv3.embeddings.column_position_embeddings",
-                    "layoutlmv3.embeddings.hierarchical_proj",
-                    "geo_head",
-                    "semi_head",
-                    "geo_line_classifier",
-                    "geo_block_classifier",
+                    "segment_context.layers", "boundary_classifier", "layoutlmv3.embeddings.line_position_embeddings",
+                    "layoutlmv3.embeddings.block_position_embeddings", "layoutlmv3.embeddings.column_position_embeddings",
+                    "layoutlmv3.embeddings.hierarchical_proj", "geo_head", "semi_head", "geo_line_classifier", "geo_block_classifier",
                 )
-                
+
                 GATE_PREFIXES = (
-                    "seg_out_proj",
-                    "layoutlmv3.embeddings.column_scale",
-                    "layoutlmv3.embeddings.hier_scale",
+                    "seg_out_proj", "layoutlmv3.embeddings.column_scale", "layoutlmv3.embeddings.hier_scale",
                 )
-                
+
                 for n, p in self.model.named_parameters():
                     if not p.requires_grad: continue
-                    
                     if any(n.startswith(g) for g in GATE_PREFIXES):
                         gate_params.append(p)
                     elif any(n.startswith(m) for m in NEW_MODULE_PREFIXES):
                         new_params.append(p)
                     else:
                         backbone_params.append(p)
-                        
+
+                # Sửa đổi: Giảm LR hệ số nhân xuống (5x, 20x) và thêm Weight decay 0.01 cho backbone/new_head
                 optimizer_grouped_parameters = [
-                    {"params": backbone_params, "lr": self.args.learning_rate},               # 1e-5
-                    {"params": new_params, "lr": self.args.learning_rate * 10},               # 1e-4
-                    {"params": gate_params, "lr": self.args.learning_rate * 100},             # 1e-3
+                    {"params": backbone_params, "lr": self.args.learning_rate, "weight_decay": 0.01},               
+                    {"params": new_params, "lr": self.args.learning_rate * 5, "weight_decay": 0.01}, # Thay vì x10, xài x5               
+                    {"params": gate_params, "lr": self.args.learning_rate * 20, "weight_decay": 0.0},  # Thay vì x100, xài x20
                 ]
-                
+
                 self.optimizer = torch.optim.AdamW(
                     optimizer_grouped_parameters, 
                     betas=(self.args.adam_beta1, self.args.adam_beta2),
                     eps=self.args.adam_epsilon,
-                    weight_decay=self.args.weight_decay  # SỬA LỖI weight_decay
                 )
             return self.optimizer
         
@@ -818,8 +829,11 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[SecretTrackingCallback(),
-        StepInjectorCallback()],
+        callbacks=[
+            SecretTrackingCallback(),
+            StepInjectorCallback(),
+            EarlyStoppingCallback(early_stopping_patience=5) # Thêm dòng này: Dừng nếu 5 lần eval không tăng điểm
+        ],
     )
     # Initialize our Trainer
     # trainer = Trainer(
