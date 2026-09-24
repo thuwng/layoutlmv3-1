@@ -50,7 +50,7 @@ rm -rf "$OUT"
   --max_column_position 50 \
   --lambda_bound_init 0.01 \
   --geo_y_threshold 10.0 \
-  --geo_x_threshold 50.0 \
+  --geo_x_threshold 20.0 \
   --use_semantic_geometry_disentangle True \
   --lambda_orth_init 0.005 \
   --lambda_geo_init 0.05 \

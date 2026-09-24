@@ -96,49 +96,21 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             self.semi_head = None
             self.lambda_geo = 0.0
             self.lambda_orth = 0.0
-                # ReZero-style gate: starts at 0 so at step 0 the context module is a
-        # NO-OP (output == plain mean-pooled vector, i.e. identical to a
-        # "segment pooling only, no inter-segment context" ablation). Training
-        # then gradually learns how much of the (initially random) context
-        # transform to blend in. This avoids injecting a large random
-        # perturbation into a well-pretrained backbone's features right at
-        # the start of fine-tuning -- important on tiny datasets like FUNSD
-        # (149 docs) where a high-variance early gradient can permanently
-        # damage the pretrained representation.
-        self.segment_context_gate = nn.Parameter(torch.zeros(1))
 
-        # Small embedding so the classifier can still tell "first token of the
-        # segment" (-> should predict B-xxx) apart from the rest (-> I-xxx),
-        # even though every token in the segment otherwise shares one pooled
-        # vector. Initialized near zero so early training resembles the
-        # unmodified baseline.
-        self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
-        nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
+        self.seg_norm = nn.LayerNorm(config.hidden_size)
+        self.seg_out_proj = nn.Linear(config.hidden_size, config.hidden_size)
+
+        nn.init.zeros_(self.seg_out_proj.weight)
+        nn.init.zeros_(self.seg_out_proj.bias)
 
         self.init_weights()
         # for param in self.layoutlmv3.parameters():
         #     param.requires_grad = False
 
     def _segment_pool_and_contextualize(self, text_hidden, seg_id):
-        """
-        text_hidden: (B, L, H) hidden states for the TEXT part only
-                     (image-patch positions, if any, are handled separately
-                     by the caller and never enter this function).
-        seg_id:      (B, L) long tensor. -1 marks tokens that do not belong
-                     to any segment (special tokens / padding). Non-negative
-                     values are LOCAL segment indices per example, assigned
-                     in reading order (0, 1, 2, ...), exactly matching the
-                     bbox-equality grouping used in run_funsd_cord.py's
-                     tokenize_and_align_labels (see patch).
-
-        Returns:
-            broadcast_hidden: (B, L, H) -- every token belonging to the same
-                segment gets an IDENTICAL context-enriched vector (before the
-                is-first-token embedding is added back in `forward`).
-        """
         B, L, H = text_hidden.shape
         device = text_hidden.device
-        broadcast_hidden = text_hidden.clone()
+        broadcast_context = torch.zeros_like(text_hidden)
 
         for b in range(B):
             ids = seg_id[b]
@@ -146,7 +118,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             if valid.sum() == 0:
                 continue
 
-            uniq_segs = torch.unique(ids[valid], sorted=True)  # reading order
+            uniq_segs = torch.unique(ids[valid], sorted=True)
             n_seg = uniq_segs.shape[0]
 
             seg_vecs = torch.zeros(n_seg, H, device=device, dtype=text_hidden.dtype)
@@ -156,17 +128,17 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 seg_masks.append(mask)
                 seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
 
-            # The only place adjacent segments exchange information.
-            # Cheap: n_seg is typically tens, not hundreds, per document.
+            # Tính context liên segment
             ctx_out = self.segment_context(seg_vecs.unsqueeze(0)).squeeze(0)  # (n_seg, H)
-            # ReZero blend: at init (gate=0) this reduces to seg_vecs_ctx == seg_vecs
-            # (pure mean-pooling, no context) -- see comment on self.segment_context_gate.
-            seg_vecs_ctx = seg_vecs + self.segment_context_gate * (ctx_out - seg_vecs)
 
+            # Phân bổ context về lại từng token
             for i, mask in enumerate(seg_masks):
-                broadcast_hidden[b, mask] = seg_vecs_ctx[i]
+                broadcast_context[b, mask] = ctx_out[i]
 
-        return broadcast_hidden
+        # V2 Core: Cộng context vào hidden state gốc qua LayerNorm và Linear (Khởi tạo = 0)
+        updated_hidden = text_hidden + self.seg_out_proj(self.seg_norm(broadcast_context))
+        return updated_hidden
+    
     def _compute_boundary_loss(self, text_hidden, line_ids, labels, attention_mask, text_len):
         device = text_hidden.device
         
@@ -324,33 +296,18 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         text_hidden = sequence_output[:, :text_len, :]
         image_hidden = sequence_output[:, text_len:, :]
 
-        # ====== SỬA: Cắt seg_id để chỉ lấy phần text ======
         if seg_id is not None:
-            # Đảm bảo seg_id có đúng độ dài text
             if seg_id.shape[1] != text_len:
-                # Nếu seg_id dài hơn text_len, chỉ lấy phần text
                 if seg_id.shape[1] > text_len:
                     seg_id = seg_id[:, :text_len]
                 else:
-                    # Nếu seg_id ngắn hơn, pad với -1
                     pad_len = text_len - seg_id.shape[1]
                     pad_tensor = torch.ones(seg_id.shape[0], pad_len, device=seg_id.device, dtype=seg_id.dtype) * -1
                     seg_id = torch.cat([seg_id, pad_tensor], dim=1)
             
+            # Chỉ cần 1 dòng này để cập nhật text_hidden
             text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id)
-
-            # Add the is-first-token-of-segment signal
-            is_first = torch.zeros_like(seg_id, dtype=torch.long)
-            is_first[:, 0] = 0
-            if seg_id.shape[1] > 1:
-                prev = seg_id[:, :-1]
-                cur = seg_id[:, 1:]
-                changed = (cur != prev) & (cur >= 0)
-                is_first[:, 1:] = changed.long()
-            is_first = is_first * (seg_id >= 0).long()
-
-            text_hidden = text_hidden + self.is_first_token_embedding(is_first)
-
+            
         if image_hidden.shape[1] > 0:
             pooled_sequence = torch.cat([text_hidden, image_hidden], dim=1)
         else:

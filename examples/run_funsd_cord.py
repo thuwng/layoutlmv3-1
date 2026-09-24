@@ -459,53 +459,47 @@ def main():
         block_ids_all = []   # NEW
         column_ids_all = []
         
-        # HÀM MỚI (PHASE 1 - FIXED FINAL): Dựa trên Box Merging cấp độ Dòng (Line-level)
-        def compute_geometry_ids(bboxes, y_thresh=10.0, x_thresh=50.0):
+        # THAY THẾ HÀM compute_geometry_ids:
+        def compute_geometry_ids(bboxes, y_thresh=10.0, x_thresh=20.0): # Chỉnh mặc định x_thresh=20
             n = len(bboxes)
-            if n == 0:
-                return [], [], []
+            if n == 0: return [], [], []
 
-            centers = [((b[0]+b[2])/2, (b[1]+b[3])/2) for b in bboxes]
-            
-            # 1. GOM DÒNG (Line) - Sắp xếp theo Y, gom nếu chênh lệch Y nhỏ
-            order_y = sorted(range(n), key=lambda i: (centers[i][1], centers[i][0]))
+            # 1. GOM DÒNG: Dựa trên tâm Y
+            centers_y = [(b[1]+b[3])/2 for b in bboxes]
+            order_y = sorted(range(n), key=lambda i: centers_y[i])
             line_ids = [0] * n
-            cur_line = 0
-            prev_y = centers[order_y[0]][1]
+            cur_line, prev_y = 0, centers_y[order_y[0]]
             for k in order_y:
-                if abs(centers[k][1] - prev_y) > y_thresh:
+                if abs(centers_y[k] - prev_y) > y_thresh:
                     cur_line += 1
+                    prev_y = centers_y[k]
                 line_ids[k] = cur_line
-                prev_y = centers[k][1]
 
-            # 2. GOM CỘT TOÀN CỤC (Global Column) - Không reset theo từng dòng
-            order_x = sorted(range(n), key=lambda i: centers[i][0])
+            # 2. GOM CỘT: Dựa trên LỀ TRÁI X0 (ổn định hơn tâm X)
+            left_x = [b[0] for b in bboxes]
+            order_x = sorted(range(n), key=lambda i: left_x[i])
             col_ids = [0] * n
-            cur_col = 0
-            prev_x = centers[order_x[0]][0]
+            cur_col, prev_x = 0, left_x[order_x[0]]
             for k in order_x:
-                if abs(centers[k][0] - prev_x) > x_thresh:
+                if abs(left_x[k] - prev_x) > x_thresh:
                     cur_col += 1
+                    prev_x = left_x[k]
                 col_ids[k] = cur_col
-                prev_x = centers[k][0]
 
-            # 3. GOM BLOCK (Gom các DÒNG thành ĐOẠN VĂN)
-            # Bước 3a: Tính Bounding Box bao trùm cho từng dòng
+            # 3. GOM BLOCK: Siết chặt chống block tràn ngang
             line_boxes = {}
             for k in range(n):
                 l_id = line_ids[k]
-                b = bboxes[k]
                 if l_id not in line_boxes:
-                    line_boxes[l_id] = list(b)
+                    line_boxes[l_id] = list(bboxes[k])
                 else:
                     line_boxes[l_id] = [
-                        min(line_boxes[l_id][0], b[0]),
-                        min(line_boxes[l_id][1], b[1]),
-                        max(line_boxes[l_id][2], b[2]),
-                        max(line_boxes[l_id][3], b[3]),
+                        min(line_boxes[l_id][0], bboxes[k][0]),
+                        min(line_boxes[l_id][1], bboxes[k][1]),
+                        max(line_boxes[l_id][2], bboxes[k][2]),
+                        max(line_boxes[l_id][3], bboxes[k][3]),
                     ]
             
-            # Bước 3b: Gom dòng thành Block dựa trên khoảng cách giữa 2 box của dòng
             block_of_line = {}
             cur_block = 0
             sorted_lines = sorted(line_boxes.keys())
@@ -514,24 +508,19 @@ def main():
             for i in range(1, len(sorted_lines)):
                 curr_l = sorted_lines[i]
                 prev_l = sorted_lines[i-1]
+                b_curr, b_prev = line_boxes[curr_l], line_boxes[prev_l]
                 
-                box_curr = line_boxes[curr_l]
-                box_prev = line_boxes[prev_l]
+                dy = max(0, b_curr[1] - b_prev[3])
+                dx = max(0, max(b_prev[0], b_curr[0]) - min(b_prev[2], b_curr[2]))
                 
-                # dy: Khoảng cách Y giữa mép trên dòng dưới và mép dưới dòng trên
-                dy = max(0, box_curr[1] - box_prev[3])
-                # dx: Khoảng cách X (đánh giá xem 2 dòng có thẳng hàng dọc / giao nhau không)
-                dx = max(0, max(box_prev[0], box_curr[0]) - min(box_prev[2], box_curr[2]))
-                
-                # Nếu cách xa nhau theo Y HOẶC hoàn toàn lệch nhau theo X -> Sang Block mới
-                if dy > y_thresh * 2 or dx > x_thresh:
+                # Cắt block nếu: (a) Quá xa dọc, (b) Lệch lề ngang, (c) Dòng trước quá rộng (> 40% bề ngang)
+                width_prev = b_prev[2] - b_prev[0]
+                if dy > y_thresh * 2 or dx > 0 or width_prev > 400:
                     cur_block += 1
                 
                 block_of_line[curr_l] = cur_block
             
-            # Phân phối block_id từ Dòng về lại từng Token
             block_ids = [block_of_line[line_ids[k]] for k in range(n)]
-
             return line_ids, block_ids, col_ids
         
         for batch_index in range(len(tokenized_inputs["input_ids"])):
@@ -775,55 +764,48 @@ def main():
             if self.optimizer is None:
                 backbone_params = []
                 new_params = []
-                new_names = []
+                gate_params = []
                 
-                # Danh sách TƯỜNG MINH các module mới cần LR cao
                 NEW_MODULE_PREFIXES = (
-                    "segment_context",
+                    "segment_context.layers",
                     "boundary_classifier",
-                    "is_first_token_embedding",
                     "layoutlmv3.embeddings.line_position_embeddings",
                     "layoutlmv3.embeddings.block_position_embeddings",
                     "layoutlmv3.embeddings.column_position_embeddings",
                     "layoutlmv3.embeddings.hierarchical_proj",
-                    "layoutlmv3.embeddings.column_scale",
-                    "layoutlmv3.embeddings.hier_scale",
                     "geo_head",
                     "semi_head",
                     "geo_line_classifier",
                     "geo_block_classifier",
                 )
                 
+                GATE_PREFIXES = (
+                    "seg_out_proj",
+                    "layoutlmv3.embeddings.column_scale",
+                    "layoutlmv3.embeddings.hier_scale",
+                )
+                
                 for n, p in self.model.named_parameters():
-                    if not p.requires_grad:
-                        continue
-                    if n.startswith(NEW_MODULE_PREFIXES):
+                    if not p.requires_grad: continue
+                    
+                    if any(n.startswith(g) for g in GATE_PREFIXES):
+                        gate_params.append(p)
+                    elif any(n.startswith(m) for m in NEW_MODULE_PREFIXES):
                         new_params.append(p)
-                        new_names.append(n)
                     else:
-                        # Backbone và classifier thuộc về nhóm này
                         backbone_params.append(p)
                         
-                # Log kiểm chứng khi chạy
-                if self.is_world_process_zero():
-                    print("\n" + "="*60)
-                    print(f"⚙️ OPTIMIZER PARAMETER GROUPING:")
-                    print(f"   - Backbone + Classifier: {len(backbone_params)} tensors")
-                    print(f"   - Custom Modules (LR x5): {len(new_params)} tensors")
-                    print("   - Danh sách Custom Params (mẫu):")
-                    for name in new_names[:10]:
-                        print(f"     > {name}")
-                    print("="*60 + "\n")
-
                 optimizer_grouped_parameters = [
-                    {"params": backbone_params, "lr": self.args.learning_rate}, 
-                    {"params": new_params, "lr": self.args.learning_rate * 5} 
+                    {"params": backbone_params, "lr": self.args.learning_rate},               # 1e-5
+                    {"params": new_params, "lr": self.args.learning_rate * 10},               # 1e-4
+                    {"params": gate_params, "lr": self.args.learning_rate * 100},             # 1e-3
                 ]
                 
                 self.optimizer = torch.optim.AdamW(
                     optimizer_grouped_parameters, 
                     betas=(self.args.adam_beta1, self.args.adam_beta2),
                     eps=self.args.adam_epsilon,
+                    weight_decay=self.args.weight_decay  # SỬA LỖI weight_decay
                 )
             return self.optimizer
         
